@@ -1,0 +1,13 @@
+# Ignore temporary files
+*.tmp
+temp_*
+# Ignore log files
+*.log
+logs/
+# Ignore Python cache files
+__pycache__/
+*.pyc
+# Ignore sensitive configuration files
+config.ini
+.env
+.venv
