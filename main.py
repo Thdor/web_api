@@ -1,102 +1,107 @@
-from fastapi import FastAPI, HTTPException, Query
-from pydantic import BaseModel
-from typing import Optional
+from fastapi import FastAPI, Depends, HTTPException, Query
+from sqlalchemy.orm import Session
+from typing import List, Optional
+from models import Base, Item
+from schemas import ItemCreate, ItemUpdate, ItemResponse
+from database import engine, get_db
+
+Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
-# In-memory "database"
-items_db = []
+@app.post("/items/", response_model=ItemResponse)
+def create_item(item: ItemCreate, db: Session = Depends(get_db)):
+    db_item = Item(**item.dict())
+    db.add(db_item)
+    db.commit()
+    db.refresh(db_item)
+    return db_item
 
-# Define a data model
-class Item(BaseModel):
-    name: str
-    price: float
-    description: str = None
-    in_stock: bool = True
-
-# Home route
-@app.get("/")
-def read_root():
-    return {"message": "Welcome to the API!"}
-
-# Create item
-@app.post("/items/")
-def create_item(item: Item):
-    item_id = len(items_db)
-    item_dict = item.dict()
-    item_dict["id"] = item_id
-    item_dict["is_deleted"] = False  # Soft delete flag
-    items_db.append(item_dict)
-    return {"message": "Item added", "item": item_dict}
-
-# Get all non-deleted items
-@app.get("/items/")
-def get_all_items(
-    search: Optional[str] = Query(None, description="Search keyword"),
-    skip: int = Query(0, ge=0, description="Items to skip (for pagination)"),
-    limit: int = Query(10, ge=1, le=100, description="Max number of items to return")
+@app.get("/items/", response_model=List[ItemResponse])
+def read_items(
+    search: Optional[str] = Query(None),
+    skip: int = 0,
+    limit: int = 10,
+    min_price: Optional[float] = Query(None, ge=0),
+    max_price: Optional[float] = Query(None, ge=0),
+    in_stock: Optional[bool] = None,
+    sort_by: Optional[str] = None,   # e.g. "price,name"
+    sort_order: Optional[str] = "asc", # e.g. "desc,asc"
+    db: Session = Depends(get_db)
 ):
-    # Filter only non-deleted items
-    visible_items = [item for item in items_db if not item["is_deleted"]]
+    query = db.query(Item).filter(Item.is_deleted == False)
 
-    # Apply search (if provided)
     if search:
-        search = search.lower()
-        visible_items = [
-            item for item in visible_items
-            if search in item["name"].lower() or
-               (item.get("description") and search in item["description"].lower())
-        ]
+        query = query.filter(
+            (Item.name.ilike(f"%{search}%")) | 
+            (Item.description.ilike(f"%{search}%"))
+        )
 
-    # Apply pagination
-    paginated_items = visible_items[skip: skip + limit]
-    return {
-        "total": len(visible_items),
-        "skip": skip,
-        "limit": limit,
-        "items": paginated_items
-    }
-# Get deleted items only
-@app.get("/items/deleted")
-def get_deleted_items():
-    deleted_items = [item for item in items_db if item["is_deleted"]]
-    return {"deleted_items": deleted_items}
-# Get item by ID
-@app.get("/items/{item_id}")
-def get_item(item_id: int):
-    if item_id < 0 or item_id >= len(items_db) or items_db[item_id]["is_deleted"]:
+    if min_price is not None:
+        query = query.filter(Item.price >= min_price)
+    if max_price is not None:
+        query = query.filter(Item.price <= max_price)
+    if in_stock is not None:
+        query = query.filter(Item.in_stock == in_stock)
+
+    # Sorting support
+    if sort_by:
+        sort_fields = [field.strip() for field in sort_by.split(",")]
+        sort_orders = [order.strip().lower() for order in sort_order.split(",")]
+        while len(sort_orders) < len(sort_fields):
+            sort_orders.append("asc")
+
+        for field, order in reversed(list(zip(sort_fields, sort_orders))):
+            column = getattr(Item, field, None)
+            if not column or order not in {"asc", "desc"}:
+                continue
+            if order == "desc":
+                query = query.order_by(column.desc())
+            else:
+                query = query.order_by(column.asc())
+
+    items = query.offset(skip).limit(limit).all()
+    return items
+
+@app.get("/items/{item_id}", response_model=ItemResponse)
+def read_item(item_id: int, db: Session = Depends(get_db)):
+    item = db.query(Item).filter(Item.id == item_id, Item.is_deleted == False).first()
+    if not item:
         raise HTTPException(status_code=404, detail="Item not found")
-    return items_db[item_id]
+    return item
 
-# Update item (only if not deleted)
-@app.put("/items/{item_id}")
-def update_item(item_id: int, updated_item: Item):
-    if item_id < 0 or item_id >= len(items_db) or items_db[item_id]["is_deleted"]:
+@app.put("/items/{item_id}", response_model=ItemResponse)
+def update_item(item_id: int, item_update: ItemUpdate, db: Session = Depends(get_db)):
+    item = db.query(Item).filter(Item.id == item_id, Item.is_deleted == False).first()
+    if not item:
         raise HTTPException(status_code=404, detail="Item not found")
 
-    updated_data = updated_item.dict()
-    updated_data["id"] = item_id
-    updated_data["is_deleted"] = False
-    items_db[item_id] = updated_data
-    return {"message": "Item updated", "item": updated_data}
+    for key, value in item_update.dict().items():
+        setattr(item, key, value)
+    db.commit()
+    db.refresh(item)
+    return item
 
-# Soft-delete item
 @app.delete("/items/{item_id}")
-def delete_item(item_id: int):
-    if item_id < 0 or item_id >= len(items_db) or items_db[item_id]["is_deleted"]:
+def soft_delete_item(item_id: int, db: Session = Depends(get_db)):
+    item = db.query(Item).filter(Item.id == item_id, Item.is_deleted == False).first()
+    if not item:
         raise HTTPException(status_code=404, detail="Item not found")
+    item.is_deleted = True
+    db.commit()
+    return {"message": "Item soft-deleted"}
 
-    items_db[item_id]["is_deleted"] = True
-    return {"message": "Item soft-deleted", "item": items_db[item_id]}
+@app.get("/items/deleted", response_model=List[ItemResponse])
+def read_deleted_items(skip: int = 0, limit: int = 10, db: Session = Depends(get_db)):
+    items = db.query(Item).filter(Item.is_deleted == True).offset(skip).limit(limit).all()
+    return items
 
-# Restore a soft-deleted item
-@app.put("/items/{item_id}/restore")
-def restore_item(item_id: int):
-    if item_id < 0 or item_id >= len(items_db):
-        raise HTTPException(status_code=404, detail="Item not found")
-
-    if not items_db[item_id]["is_deleted"]:
-        raise HTTPException(status_code=400, detail="Item is not deleted")
-
-    items_db[item_id]["is_deleted"] = False
-    return {"message": "Item restored", "item": items_db[item_id]}
+@app.put("/items/{item_id}/restore", response_model=ItemResponse)
+def restore_item(item_id: int, db: Session = Depends(get_db)):
+    item = db.query(Item).filter(Item.id == item_id, Item.is_deleted == True).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found or not deleted")
+    item.is_deleted = False
+    db.commit()
+    db.refresh(item)
+    return item
